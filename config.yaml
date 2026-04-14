@@ -1,0 +1,25 @@
+name: lyra
+version: v1.0
+
+log:
+  level: "debug"
+  file_name: "monitor.log"
+  max_size: 200 #日志文件的最大内存限制（Mb）
+  max_backups: 7 #最大备份数量
+  max_age: 30 #日志保留时间上限
+
+database:
+  host: "10.10.100.23"
+  port: "3306"
+  username: "root"
+  password: "123"
+  dbname: "deploy_agent"
+  max_idle_conns: 50 #连接池中的连接数，可同时连接的最大个数，如果同时来100个连接，只能先连接50个，其它50个排队等待前面的连接释放
+  max_open_conns: 200 #支持最大连接数
+  conn_max_lifetime: "1" # 单位: h
+  slow_threshold_ms: 1000 # Gorm slow sql日志阈值，单位毫秒
+  ignore_record_not_found_error: true # gorm: 是否忽略record not found错误
+  gorm_log_level: "info" # gorm日志级别
+
+karmada:
+  kubeconfig: "kubeconfig/karmada-apiserver.config"
