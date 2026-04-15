@@ -214,6 +214,12 @@ func getDefaultPlugins() *runtime.Plugins {
 		QueueSort: runtime.PluginSet{
 			Enabled: []runtime.Plugin{{Name: prioritysort.Name}},
 		},
+		PreFilter: runtime.PluginSet{
+			Enabled: []runtime.Plugin{
+				{Name: gpurender.Name},
+				{Name: noderesources.Name},
+			},
+		},
 		Filter: runtime.PluginSet{
 			Enabled: []runtime.Plugin{
 				{Name: gpurender.Name},

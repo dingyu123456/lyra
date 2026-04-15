@@ -182,6 +182,12 @@ func (sched *Scheduler) bindingCycle(
 		return framework.NewStatus(framework.Error, "Dispatch failed")
 	}
 
+	// Dispatch 成功后，标记绑定完成，启动 TTL 倒计时
+	// 如果子集群在 TTL 时间内没有上报 Pod 事件进行对账，预扣资源会被自动回收
+	if err := sched.Cache.FinishBinding(logger, assumedPod); err != nil {
+		logger.Error("Failed to finish binding", zap.Error(err))
+	}
+
 	logger.Info("Pod successfully dispatched", zap.Duration("latency", time.Since(start)))
 	return framework.NewStatus(framework.Success)
 }

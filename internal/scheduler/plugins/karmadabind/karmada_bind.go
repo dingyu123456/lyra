@@ -31,11 +31,6 @@ func (k *KarmadaBind) Name() string {
 
 // Bind 执行真正的策略下发动作
 func (k *KarmadaBind) Bind(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, result framework.ScheduleResult) *framework.Status {
-	// 调用 Dispatcher 执行联邦策略下发
-	// 这里的 Dispatch 会创建 PP 和 OP，从而触发子集群的 Pod 创建
-	if err := k.dispatcher.Dispatch(ctx, pod, result); err != nil {
-		return framework.AsStatus(err)
-	}
-
+	// 调度决策已经通过 Dispatcher 在 bindingCycle 中下发，这里只需要确认绑定成功即可
 	return framework.NewStatus(framework.Success)
 }

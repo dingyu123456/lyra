@@ -146,7 +146,8 @@ type clusterInfoListItem struct {
 
 func newClusterInfoListItem(info *framework.ClusterInfo) *clusterInfoListItem {
 	return &clusterInfoListItem{
-		info: info,
+		info:  info,
+		nodes: make(map[string]*nodeInfoListItem),
 	}
 }
 

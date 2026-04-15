@@ -98,7 +98,42 @@ func main() {
 	}
 	logger.Info("All caches synced successfully!")
 
+	// --- 诊断：打印缓存状态 ---
+	printCacheDiagnostics(logger, sched)
+
 	// 9. ## 调度器点火 ##
 	logger.Info("Lyra Scheduler is running")
 	sched.Run(ctx)
+}
+
+// printCacheDiagnostics 打印调度器缓存的详细状态，用于验证缓存是否正确同步了 GPU 信息
+func printCacheDiagnostics(logger *zap.Logger, sched *scheduler.Scheduler) {
+	dump := sched.Cache.Dump()
+
+	logger.Info("=== Cache Diagnostics ===",
+		zap.Int("cluster_count", sched.Cache.ClusterCount()),
+		zap.Int("assumed_pods_count", len(dump.AssumedPods)))
+
+	for clusterName, clusterInfo := range dump.Clusters {
+		logger.Info("  Cluster",
+			zap.String("cluster", clusterName),
+			zap.Int("nodes_count", len(clusterInfo.Nodes)))
+
+		for nodeName, nodeInfo := range clusterInfo.Nodes {
+			logger.Info("    Node",
+				zap.String("node", nodeName),
+				zap.Int("gpus_count", len(nodeInfo.GPUs)))
+
+			for _, gpu := range nodeInfo.GPUs {
+				logger.Info("      GPU",
+					zap.String("uuid", gpu.UUID),
+					zap.String("type", gpu.Type),
+					zap.Int64("memory_total", gpu.AllocatableMem),
+					zap.Int64("memory_used", gpu.RequestedMem),
+					zap.Int64("core_total", gpu.AllocatableCore),
+					zap.Int64("core_used", gpu.RequestedCore))
+			}
+		}
+	}
+	logger.Info("=== End Diagnostics ===")
 }

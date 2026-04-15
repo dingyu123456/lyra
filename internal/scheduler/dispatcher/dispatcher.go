@@ -117,18 +117,22 @@ func (d *dispatcherImpl) ensureOverridePolicy(ctx context.Context, pod *corev1.P
 	// 1. 获取要告诉 Hami 的目标 GPU UUID 字符串 (如 "GPU-123,GPU-456")
 	gpuTargetUUIDs := framework.FormatHamiVGPUAnnotation(result.SuggestedGPUs)
 
-	// 2. 构造 PlaintextOverriders，只修改下发途中的镜像，不碰原始 Pod
-	overriders := []policyv1alpha1.PlaintextOverrider{
-		{
-			Path:     "/spec/nodeName",
-			Operator: policyv1alpha1.OverriderOpAdd,
-			Value:    apiextensionsv1.JSON{Raw: []byte(fmt.Sprintf("%q", result.SuggestedNode))},
-		},
-	}
+	// 2. 构造 Overriders
+	var overriders []policyv1alpha1.PlaintextOverrider
 
-	// 只有当分配了具体的 GPU 时，才在 OP 中追加 GPU 绑定指令
+	// 🌟 关键修复：重置 schedulerName 为 default-scheduler
+	// 因为 Pod 在 Karmada 控制面使用 lyra-scheduler 调度，但下发到子集群后，
+	// 子集群没有 lyra-scheduler，必须让子集群的调度器（HAMI / default）接手
+	overriders = append(overriders, policyv1alpha1.PlaintextOverrider{
+		Path:     "/spec/schedulerName",
+		Operator: policyv1alpha1.OverriderOpAdd,
+		Value:    apiextensionsv1.JSON{Raw: []byte(fmt.Sprintf("%q", "default-scheduler"))},
+	})
+
+	// 如果分配了 GPU，注入 GPU UUID 注解
+	// HAMI 设备插件会根据 UUID 自动识别目标节点并完成调度
+	// 注意：不能同时设置 nodeName，否则 HAMI webhook 会拒绝（"pod has node assigned"）
 	if gpuTargetUUIDs != "" {
-		// 注意：JSON Patch 中路径的 '/' 必须转义为 '~1'
 		gpuAnnotationPath := fmt.Sprintf("/metadata/annotations/%s",
 			strings.ReplaceAll(framework.AnnotationUseGPUUUID, "/", "~1"))
 
@@ -136,6 +140,15 @@ func (d *dispatcherImpl) ensureOverridePolicy(ctx context.Context, pod *corev1.P
 			Path:     gpuAnnotationPath,
 			Operator: policyv1alpha1.OverriderOpAdd,
 			Value:    apiextensionsv1.JSON{Raw: []byte(fmt.Sprintf("%q", gpuTargetUUIDs))},
+		})
+	}
+
+	// 如果没有分配 GPU（非 GPU 任务），需要手动设置 nodeName 确保调度到正确节点
+	if gpuTargetUUIDs == "" && result.SuggestedNode != "" {
+		overriders = append(overriders, policyv1alpha1.PlaintextOverrider{
+			Path:     "/spec/nodeName",
+			Operator: policyv1alpha1.OverriderOpAdd,
+			Value:    apiextensionsv1.JSON{Raw: []byte(fmt.Sprintf("%q", result.SuggestedNode))},
 		})
 	}
 
