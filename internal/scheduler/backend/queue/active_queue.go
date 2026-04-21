@@ -26,7 +26,6 @@ import (
 	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
 // activeQueuer is a wrapper for activeQ related operations.
@@ -223,9 +222,6 @@ func (aq *activeQueue) unlockedPop(logger *zap.Logger) (*framework.QueuedPodInfo
 	aq.schedCycle++
 
 	// Update metrics and reset the set of unschedulable plugins for the next attempt.
-	for plugin := range pInfo.UnschedulablePlugins.Union(pInfo.PendingPlugins) {
-		metrics.UnschedulableReason(plugin, pInfo.Pod.Spec.SchedulerName).Dec()
-	}
 	pInfo.UnschedulablePlugins.Clear()
 	pInfo.PendingPlugins.Clear()
 

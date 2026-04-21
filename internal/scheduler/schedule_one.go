@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,9 @@ const (
 	// numberOfHighestScoredNodesToReport is the number of node scores
 	// to be included in ScheduleResult.
 	numberOfHighestScoredNodesToReport = 3
+
+	// SnapshotModeFull 环境变量值，启用全量快照模式
+	SnapshotModeFull = "full"
 )
 
 // ScheduleOne 包含了单个 Pod 调度的完整工程化工作流
@@ -70,11 +74,20 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	// 阶段一：同步调度周期 (Scheduling Cycle)
 	// ==========================================
 	scheduleResult, assumedPod, status := sched.schedulingCycle(schedulingCycleCtx, state, sched.Framework, podInfo, start)
+	schedulingCycleLatency := time.Since(start)
 	if !status.IsSuccess() {
 		// 调度失败（没算力等），打回队列
 		sched.FailureHandler(schedulingCycleCtx, sched.Framework, podInfo, status, start)
 		return
 	}
+	logger.Info("SchedulingCycle completed",
+		zap.Duration("scheduling_cycle_latency", schedulingCycleLatency),
+		zap.String("cluster", scheduleResult.SuggestedCluster),
+		zap.String("node", scheduleResult.SuggestedNode),
+		zap.Int("feasible_nodes", scheduleResult.FeasibleNodes),
+		zap.Int("evaluated_nodes", scheduleResult.EvaluatedNodes),
+		zap.Int64("e2e_ns", schedulingCycleLatency.Nanoseconds()),
+	)
 
 	// ==========================================
 	// 阶段二：异步绑定/下发周期 (Binding Cycle)
@@ -115,6 +128,7 @@ func (sched *Scheduler) schedulingCycle(
 	// 这一步必须在同步周期内完成，因为它是独占状态机的写操作
 	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
 	// This allows us to keep scheduling without waiting on binding to occur.
+	assumeStart := time.Now()
 	assumedPodInfo := podInfo.DeepCopy()
 	assumedPod := assumedPodInfo.Pod
 
@@ -124,6 +138,7 @@ func (sched *Scheduler) schedulingCycle(
 	// TODO 比如说绑定成功后pod事件会触发cache.addPod()进行数据对账（实际分配的资源信息与决策信息是否相同），
 	// TODO 而这时候是没有调度结果的，完全靠解析pod中的字段或者注解，所以我们在预扣逻辑中也要将决策信息以同样格式写到pod中。
 	err = sched.assume(logger, assumedPod, scheduleResult)
+	assumeDuration := time.Since(assumeStart)
 	if err != nil {
 		logger.Error("Failed to assume pod in cache", zap.Error(err))
 		return framework.ScheduleResult{}, assumedPodInfo, framework.NewStatus(framework.Error, "Assume failed")
@@ -150,6 +165,11 @@ func (sched *Scheduler) schedulingCycle(
 		}
 		return framework.ScheduleResult{}, nil, runPermitStatus
 	}
+	// 记录 Assume 阶段耗时
+	logger.Info("[PERF] Assume timing",
+		zap.String("pod", pod.Name),
+		zap.Duration("assume_us", assumeDuration),
+	)
 	return scheduleResult, assumedPodInfo, runPermitStatus
 }
 
@@ -255,15 +275,22 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, fwk framewo
 	err := status.AsError()
 	errMsg := status.Message()
 
-	// 2. 诊断并记录“失败病历本”
-	// 在 Lyra 中，如果 Status 记录了是因为哪个插件失败的，提取出来并注入到 podInfo 中，
-	// 这样 QueueingHint 引擎后续就能通过这个“病历本”精准唤醒它。
+	// 2. 诊断并记录"失败病历本"
+	// 从 FitError.Diagnosis 中提取所有失败的插件名称，
+	// 这样 QueueingHint 引擎后续就能通过这个"病历本"精准唤醒它。
 	if status.Code() == framework.Unschedulable {
-		if failedPlugin := status.Plugin(); failedPlugin != "" {
+		// 优先从 FitError.Diagnosis 提取所有失败插件
+		var fitErr *framework.FitError
+		if errors.As(err, &fitErr) && fitErr.Diagnosis.UnschedulablePlugins.Len() > 0 {
+			for _, plugin := range fitErr.Diagnosis.UnschedulablePlugins.UnsortedList() {
+				podInfo.UnschedulablePlugins.Insert(plugin)
+			}
+		} else if failedPlugin := status.Plugin(); failedPlugin != "" {
 			podInfo.UnschedulablePlugins.Insert(failedPlugin)
 		}
 		logger.Debug("Unable to schedule pod; no fit; waiting",
 			zap.String("pod", pod.Name),
+			zap.Strings("failed_plugins", podInfo.UnschedulablePlugins.UnsortedList()),
 			zap.String("err", errMsg))
 	} else {
 		// 调度器内部遇到了真正的 Error（如网络超时、内部组件 panic 等）
@@ -355,14 +382,26 @@ func (sched *Scheduler) schedulePod(
 	logger := lyralog.FromContext(ctx)
 
 	// 1. 初始化性能追踪器 (Trace)
-	// 这个工具会在方法 defer 结束时，如果总耗时超过 100ms，自动打印出完整的耗时火焰图日志！
+	// 这个工具会在方法 defer 结束时，如果总耗时超过阈值，自动打印出完整的耗时火焰图日志
+	// 阈值降低到 1ms，确保正常调度也能输出各阶段耗时（用于性能分析）
 	traceObj := trace.New("Scheduling", trace.Field{Key: "namespace", Value: pod.Namespace}, trace.Field{Key: "name", Value: pod.Name})
-	defer traceObj.LogIfLong(100 * time.Millisecond)
+	defer traceObj.LogIfLong(1 * time.Millisecond)
 
 	// 2. 极速克隆全局二维快照
-	if err := sched.Cache.UpdateSnapshot(logger, sched.ClusterInfoSnapshot); err != nil {
-		return result, err
+	traceStart := time.Now()
+	var snapshotMode string
+	if os.Getenv("LYRA_SNAPSHOT_MODE") == SnapshotModeFull {
+		if err := sched.Cache.FullUpdateSnapshot(logger, sched.ClusterInfoSnapshot); err != nil {
+			return result, err
+		}
+		snapshotMode = "full"
+	} else {
+		if err := sched.Cache.UpdateSnapshot(logger, sched.ClusterInfoSnapshot); err != nil {
+			return result, err
+		}
+		snapshotMode = "incremental"
 	}
+	snapshotDuration := time.Since(traceStart)
 	traceObj.Step("Snapshotting scheduler cache done")
 
 	if sched.ClusterInfoSnapshot.NumClusters() == 0 {
@@ -370,10 +409,12 @@ func (sched *Scheduler) schedulePod(
 	}
 
 	// 3. 寻找符合条件的节点 (内部包含了 PreFilter 和 Filter 逻辑)
+	filterStart := time.Now()
 	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
+	filterDuration := time.Since(filterStart)
 	traceObj.Step("Computing predicates done")
 
 	// 如果没有节点满足，返回携带有 Diagnosis (病历本) 的专属 FitError
@@ -386,6 +427,7 @@ func (sched *Scheduler) schedulePod(
 	}
 
 	// 4. 优选打分 (Score)
+	scoreStart := time.Now()
 	var bestNode *framework.NodeInfo
 	if len(feasibleNodes) == 1 {
 		// 只有一个满足，直接钦定，省去打分开销
@@ -414,15 +456,35 @@ func (sched *Scheduler) schedulePod(
 			return result, err
 		}
 	}
+	scoreDuration := time.Since(scoreStart)
 	traceObj.Step("Prioritizing done")
 
 	// 5. 异构算力精细化分配 (GPU Allocation)
+	gpuStart := time.Now()
 	// 在确定了宇宙最强节点后，从该节点上挑出具体的物理卡 UUID
 	targetGPUs, err := sched.allocateGPUsOnNode(ctx, state, bestNode, pod)
 	if err != nil {
 		return result, err
 	}
+	gpuDuration := time.Since(gpuStart)
 	traceObj.Step("GPU UUID allocation done")
+
+	clonedClusters, clonedNodes := sched.ClusterInfoSnapshot.LastClonedStats()
+
+	// 打印各阶段耗时日志（Info 级别 + [PERF] 前缀，方便 grep 解析）
+	// 使用纳秒精度输出，避免 sub-microsecond 耗时被截断为 0
+	logger.Info("[PERF] SchedulePod stage timing",
+		zap.String("pod", pod.Name),
+		zap.Int64("snapshot_ns", snapshotDuration.Nanoseconds()),
+		zap.Int64("filter_ns", filterDuration.Nanoseconds()),
+		zap.Int64("score_ns", scoreDuration.Nanoseconds()),
+		zap.Int64("gpu_alloc_ns", gpuDuration.Nanoseconds()),
+		zap.String("snapshot_mode", snapshotMode),
+			zap.Int("feasible_nodes", len(feasibleNodes)),
+		zap.Int("total_nodes", sched.ClusterInfoSnapshot.NodeCount()),
+		zap.Int("cloned_clusters", clonedClusters),
+		zap.Int("cloned_nodes", clonedNodes),
+	)
 
 	// 6. 组装结果返回 (去掉了 Reserve，它属于外层的 schedulingCycle)
 	return framework.ScheduleResult{
@@ -569,7 +631,7 @@ func (sched *Scheduler) findNodesThatPassFilters(
 		return nil, err
 	}
 
-	// 5. 并发结束后，主协程单线程汇总“病历本” (绝对安全)
+	// 5. 并发结束后，主协程单线程汇总"病历本" (绝对安全)
 	for _, status := range statuses {
 		if status != nil && status.Plugin() != "" {
 			diagnosis.UnschedulablePlugins.Insert(status.Plugin())
@@ -606,7 +668,7 @@ func (sched *Scheduler) prioritizeNodes(
 	}
 
 	// 2. 宏观打分准备 (PreScore)
-	// 这是一个非常重要的钩子。比如某个打分插件需要知道“所有候选节点的显存总量”，
+	// 这是一个非常重要的钩子。比如某个打分插件需要知道"所有候选节点的显存总量"，
 	// 它可以在 PreScore 阶段遍历一次 nodes 算好，存进 state 黑板里，
 	// 避免在后面的并发 Score 阶段重复计算。
 	preScoreStatus := fwk.RunPreScorePlugins(ctx, state, pod, nodes)
@@ -621,7 +683,7 @@ func (sched *Scheduler) prioritizeNodes(
 		return nil, scoreStatus.AsError()
 	}
 
-	// 4. 打印详细的打分日志，极大地帮助后续开发排查“为什么选了这台机器”
+	// 4. 打印详细的打分日志，极大地帮助后续开发排查"为什么选了这台机器"
 	// 【修改点】使用 zap 的 Core().Enabled() 来拦截高性能 Debug 日志
 	// 如果当前日志级别高于 Debug（比如线上环境是 Info），这个 if 就进不去，
 	// 完美避免了成千上万个节点的 for 循环和字符串拼接开销！

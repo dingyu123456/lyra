@@ -183,6 +183,11 @@ func NewScheduler(
 	sched.SchedulePod = sched.schedulePod
 	sched.FailureHandler = sched.handleSchedulingFailure
 
+	// 4.5 接入 QueueingHint：将插件的 EventsToRegister 传给队列
+	if err := sched.initQueueingHintMap(ctx); err != nil {
+		return nil, fmt.Errorf("initializing queueing hint map: %w", err)
+	}
+
 	// 5. 初始化多集群管理器
 	sched.ClusterManager = multicluster.NewClusterAccessManager(
 		ctx,
@@ -206,6 +211,37 @@ func (sched *Scheduler) addControlPlaneEventHandlers(kubeFactory informers.Share
 	// B. 监听集群状态变化 (从 karmadaFactory 获取)
 	clusterInformer := karmadaFactory.Cluster().V1alpha1().Clusters().Informer()
 	sched.addClusterEventHandlers(clusterInformer)
+}
+
+// initQueueingHintMap 从 Framework 的插件收集 EventsToRegister，传给队列
+func (sched *Scheduler) initQueueingHintMap(ctx context.Context) error {
+	hintMap := make(map[framework.ClusterEvent][]framework.ClusterEventWithPluginHint)
+
+	// 遍历所有实现了 EnqueueExtensions 的插件
+	for _, ext := range sched.Framework.EnqueueExtensions() {
+		eventsWithHints, err := ext.EventsToRegister(ctx)
+		if err != nil {
+			return fmt.Errorf("getting EventsToRegister from plugin: %w", err)
+		}
+
+		// 获取插件名（通过 Plugin 接口的 Name() 方法）
+		pluginName := ""
+		if p, ok := ext.(interface{ Name() string }); ok {
+			pluginName = p.Name()
+		}
+
+		for _, eventWithHint := range eventsWithHints {
+			hintMap[eventWithHint.Event] = append(hintMap[eventWithHint.Event], framework.ClusterEventWithPluginHint{
+				Event:          eventWithHint.Event,
+				PluginName:     pluginName,
+				QueueingHintFn: eventWithHint.QueueingHintFn,
+			})
+		}
+	}
+
+	// 传给队列
+	sched.SchedulingQueue.SetQueueingHintMap(hintMap)
+	return nil
 }
 
 // getDefaultPlugins 定义 Lyra 调度器默认开启的插件集

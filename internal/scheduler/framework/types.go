@@ -219,6 +219,14 @@ type ClusterEventWithHint struct {
 	QueueingHintFn QueueingHintFn
 }
 
+// ClusterEventWithPluginHint 包含插件名的 ClusterEventWithHint
+// 用于 SetQueueingHintMap 接口
+type ClusterEventWithPluginHint struct {
+	Event          ClusterEvent
+	PluginName     string
+	QueueingHintFn QueueingHintFn
+}
+
 // QueueingHintFn returns a hint that signals whether the event can make a Pod,
 // which was rejected by this plugin in the past scheduling cycle, schedulable or not.
 // It's called before a Pod gets moved from unschedulableQ to backoffQ or activeQ.

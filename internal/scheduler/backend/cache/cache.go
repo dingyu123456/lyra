@@ -190,6 +190,18 @@ func (cache *cacheImpl) UpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) e
 	snapshotGeneration := snapshot.generation
 	updateClusterList := false // 标记是否需要重建连续的 slice 列表
 
+	// 诊断日志：记录进入 UpdateSnapshot 时的 Generation 状态
+	if cache.headCluster != nil {
+		logger.Debug("[SNAPSHOT-DIAG] UpdateSnapshot entry",
+			zap.Int64("snapshot_gen", snapshotGeneration),
+			zap.Int64("head_cluster_gen", cache.headCluster.info.Generation),
+			zap.String("head_cluster", cache.headCluster.info.ClusterName),
+		)
+	}
+
+	clonedClusters := 0
+	clonedNodes := 0
+
 	// ==========================================
 	// 🌟 核心一：第一维宏观集群遍历 (Cluster MRU)
 	// ==========================================
@@ -197,9 +209,14 @@ func (cache *cacheImpl) UpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) e
 		// 【降维打击 1】如果当前集群的 Generation <= 快照 Generation
 		// 说明这个集群以及它后面的所有集群，自上次调度以来都没有发生任何变化！直接 Break！
 		if clusterNode.info.Generation <= snapshotGeneration {
+			logger.Debug("[SNAPSHOT-DIAG] Cluster generation <= snapshot, breaking",
+				zap.String("cluster", clusterNode.info.ClusterName),
+				zap.Int64("cluster_gen", clusterNode.info.Generation),
+				zap.Int64("snapshot_gen", snapshotGeneration))
 			break
 		}
 
+		clonedClusters++
 		// 在快照中寻找这个集群，如果没有则初始化
 		existingCluster, ok := snapshot.clusterInfoMap[clusterNode.info.ClusterName]
 		if !ok {
@@ -235,7 +252,19 @@ func (cache *cacheImpl) UpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) e
 
 			// 深拷贝发生变化的节点，并更新到快照中
 			existingCluster.Nodes[n.info.NodeName] = n.info.DeepCopy()
+			clonedNodes++
 		}
+
+		// 诊断日志：记录本次快照克隆了多少集群和节点
+		logger.Debug("[SNAPSHOT-DIAG] UpdateSnapshot summary",
+			zap.Int("cloned_clusters", clonedClusters),
+			zap.Int("cloned_nodes", clonedNodes),
+			zap.Int64("new_snapshot_gen", snapshot.generation),
+		)
+
+		// 记录到快照，供性能分析使用
+		snapshot.lastClonedClusters = clonedClusters
+		snapshot.lastClonedNodes = clonedNodes
 	}
 
 	// 更新全局快照的最新世代戳
@@ -288,6 +317,55 @@ func (cache *cacheImpl) UpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) e
 		logger.Error(errMsg)
 		return fmt.Errorf("%s", errMsg)
 	}
+
+	return nil
+}
+
+// FullUpdateSnapshot 全量克隆快照，用于性能对比实验
+// 不使用 Generation 号和 MRU 链表优化，每次调度都完整克隆所有集群和节点数据
+func (cache *cacheImpl) FullUpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) error {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	// 清空旧快照，全量重建
+	snapshot.clusterInfoMap = make(map[string]*framework.ClusterInfo, len(cache.clusters))
+	snapshot.clusterInfoList = make([]*framework.ClusterInfo, 0, len(cache.clusters))
+
+	for _, ci := range cache.clusters {
+		clone := &framework.ClusterInfo{
+			ClusterName: ci.info.ClusterName,
+			Nodes:       make(map[string]*framework.NodeInfo, len(ci.nodes)),
+		}
+		if ci.info.Allocatable != nil {
+			clone.Allocatable = ci.info.Allocatable.Clone()
+		}
+		if ci.info.Requested != nil {
+			clone.Requested = ci.info.Requested.Clone()
+		}
+		if ci.info.Cluster() != nil {
+			clone.SetCluster(ci.info.Cluster().DeepCopy())
+		}
+
+		for _, ni := range ci.nodes {
+			clone.Nodes[ni.info.NodeName] = ni.info.DeepCopy()
+		}
+
+		snapshot.clusterInfoMap[clone.ClusterName] = clone
+		snapshot.clusterInfoList = append(snapshot.clusterInfoList, clone)
+	}
+
+	// 更新 generation 为最新的
+	if cache.headCluster != nil {
+		snapshot.generation = cache.headCluster.info.Generation
+	}
+
+	// 全量快照统计：复制的集群数和节点数
+	snapshot.lastClonedClusters = len(cache.clusters)
+	totalNodes := 0
+	for _, ci := range cache.clusters {
+		totalNodes += len(ci.nodes)
+	}
+	snapshot.lastClonedNodes = totalNodes
 
 	return nil
 }

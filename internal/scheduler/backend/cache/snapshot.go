@@ -16,6 +16,10 @@ type Snapshot struct {
 
 	// 全局世代计数器：用于判断本次克隆是否可以提前截断
 	generation int64
+
+	// 增量快照统计：上次 UpdateSnapshot 复制了多少数据
+	lastClonedClusters int
+	lastClonedNodes    int
 }
 
 // NewEmptySnapshot 预分配内存，供 Scheduler 结构体常驻复用
@@ -78,4 +82,8 @@ func (s *Snapshot) Get(clusterName string) (*framework.ClusterInfo, error) {
 // ClusterInfos 返回集群信息的 Lister，用于满足 framework.SharedLister 接口
 func (s *Snapshot) ClusterInfos() framework.ClusterInfoLister {
 	return s // 假设 Snapshot 已经实现了 ClusterInfoLister 接口的方法
+}
+
+func (s *Snapshot) LastClonedStats() (clusters, nodes int) {
+	return s.lastClonedClusters, s.lastClonedNodes
 }

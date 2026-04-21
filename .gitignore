@@ -35,3 +35,8 @@ go.work.sum
 *.log
 logs/
 *.log.*
+
+# Experiment results (large data, do not commit)
+experiments/snapshot/perf_results/
+experiments/queueing_hint/results/
+experiments/experiments/perf_results/

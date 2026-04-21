@@ -33,16 +33,20 @@ func NewDispatcher(kubeClient kubernetes.Interface, karmadaClient karmadaclients
 
 // Dispatch 执行联邦下发逻辑：创建 PP 和 OP
 func (d *dispatcherImpl) Dispatch(ctx context.Context, pod *corev1.Pod, result framework.ScheduleResult) error {
-	// 1. 创建 PropagationPolicy (PP)
-	// 作用：将 Pod 和 具有相同 ID 标签的配套资源（如 Service）分发到目标集群
-	if err := d.ensurePropagationPolicy(ctx, pod, result.SuggestedCluster); err != nil {
-		return fmt.Errorf("ensure propagation policy failed: %w", err)
-	}
+	// 注意：OP 必须在 PP 之前创建，避免竞态条件
+	// Karmada binding controller 处理 PP 时会立即创建 Work，如果 OP 还没创建，
+	// Work 会被同步到子集群，但不带 overrides，导致调度失败
 
-	// 2. 创建 OverridePolicy (OP)
+	// 1. 先创建 OverridePolicy (OP)
 	// 作用：注入特定的 NodeName 和 GPU UUID 信息
 	if err := d.ensureOverridePolicy(ctx, pod, result); err != nil {
 		return fmt.Errorf("ensure override policy failed: %w", err)
+	}
+
+	// 2. 再创建 PropagationPolicy (PP)
+	// 作用：将 Pod 和 具有相同 ID 标签的配套资源（如 Service）分发到目标集群
+	if err := d.ensurePropagationPolicy(ctx, pod, result.SuggestedCluster); err != nil {
+		return fmt.Errorf("ensure propagation policy failed: %w", err)
 	}
 
 	d.logger.Info("Successfully dispatched pod and policies",
@@ -77,6 +81,7 @@ func (d *dispatcherImpl) ensurePropagationPolicy(ctx context.Context, pod *corev
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ppName,
 			Namespace: pod.Namespace,
+			Labels:    pod.Labels,
 		},
 		Spec: policyv1alpha1.PropagationSpec{
 			ResourceSelectors: []policyv1alpha1.ResourceSelector{
@@ -156,6 +161,7 @@ func (d *dispatcherImpl) ensureOverridePolicy(ctx context.Context, pod *corev1.P
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      opName,
 			Namespace: pod.Namespace,
+			Labels:    pod.Labels,
 		},
 		Spec: policyv1alpha1.OverrideSpec{
 			ResourceSelectors: []policyv1alpha1.ResourceSelector{

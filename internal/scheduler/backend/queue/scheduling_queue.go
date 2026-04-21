@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -71,7 +72,7 @@ type PriorityQueue struct {
 	// 2. 退避队列：存放刚调度失败的 Pod，按退避到期时间排序的堆 (Heap)
 	podBackoffQ *heap.Heap[*framework.QueuedPodInfo]
 
-	// 3. 不可调度池：存放因为“算力不足”被拒绝的 Pod 字典
+	// 3. 不可调度池：存放因为"算力不足"被拒绝的 Pod 字典
 	unschedulablePods *UnschedulablePods
 
 	// preEnqueuePlugins registered preEnqueue plugins.
@@ -102,6 +103,13 @@ type Option func(*priorityQueueOptions)
 func WithLogger(logger *zap.Logger) Option {
 	return func(o *priorityQueueOptions) {
 		o.logger = logger
+	}
+}
+
+// WithQueueingHintMap 注入 QueueingHint 映射（从插件的 EventsToRegister 收集）
+func WithQueueingHintMap(hintMap map[framework.ClusterEvent][]*queueingHintFunction) Option {
+	return func(o *priorityQueueOptions) {
+		o.queueingHintMap = hintMap
 	}
 }
 
@@ -136,7 +144,12 @@ func NewPriorityQueue(
 		opt(&options)
 	}
 
+	// 检查环境变量控制 QueueingHint 开关
 	isSchedulingQueueHintEnabled := true
+	if envVal := os.Getenv("LYRA_QUEUEING_HINT"); envVal == "disabled" {
+		isSchedulingQueueHintEnabled = false
+		options.queueingHintMap = nil // 清空 hint map
+	}
 
 	// 3. 构造队列主体
 	pq := &PriorityQueue{
@@ -262,6 +275,11 @@ func (p *PriorityQueue) isEventOfInterest(logger *zap.Logger, event framework.Cl
 		return true
 	}
 
+	// QueueingHint 禁用时：所有事件都值得关注（全量唤醒模式）
+	if !p.isSchedulingQueueHintEnabled {
+		return true
+	}
+
 	// 🌟 降维优化：直接遍历单层 Map，不再查 Profile
 	for eventToMatch := range p.queueingHintMap {
 		if eventToMatch.Match(event) {
@@ -275,6 +293,12 @@ func (p *PriorityQueue) isEventOfInterest(logger *zap.Logger, event framework.Cl
 
 // isPodWorthRequeuing 核心大脑：判断 Pod 是否值得被重新放入活跃/退避队列
 func (p *PriorityQueue) isPodWorthRequeuing(logger *zap.Logger, pInfo *framework.QueuedPodInfo, event framework.ClusterEvent, oldObj, newObj interface{}) queueingStrategy {
+	// 0. 🌟 QueueingHint 禁用时：全量唤醒，所有 Pod 都值得重试
+	if !p.isSchedulingQueueHintEnabled {
+		logger.Debug("QueueingHint disabled, waking all pods", zap.String("pod", pInfo.Pod.Name))
+		return queueAfterBackoff
+	}
+
 	// 1. 汇总曾经拒绝过该 Pod 的所有插件
 	rejectorPlugins := pInfo.UnschedulablePlugins.Union(pInfo.PendingPlugins)
 	if rejectorPlugins.Len() == 0 {
@@ -307,7 +331,7 @@ func (p *PriorityQueue) isPodWorthRequeuing(logger *zap.Logger, pInfo *framework
 				continue
 			}
 
-			// 询问当初拒绝该 Pod 的插件：“现在值得重试吗？”
+			// 询问当初拒绝该 Pod 的插件："现在值得重试吗？"
 			hint, err := hintfn.QueueingHintFn(logger, pInfo.Pod, oldObj, newObj)
 			if err != nil {
 				logger.Error("QueueingHintFn returns error",
@@ -550,7 +574,7 @@ func (p *PriorityQueue) moveAllToActiveOrBackoffQueue(logger *zap.Logger, event 
 	// 预分配切片容量，避免扩容带来的性能损耗
 	unschedulablePods := make([]*framework.QueuedPodInfo, 0, len(p.unschedulablePods.podInfoMap))
 
-	// 遍历“失败者集中营”
+	// 遍历"失败者集中营"
 	for _, pInfo := range p.unschedulablePods.podInfoMap {
 		// 第二道局部闸门：执行你传进来的匿名过滤函数（比如：不要唤醒刚刚失败的 Pod 本身）
 		if preCheck == nil || preCheck(pInfo.Pod) {
@@ -562,55 +586,73 @@ func (p *PriorityQueue) moveAllToActiveOrBackoffQueue(logger *zap.Logger, event 
 	p.movePodsToActiveOrBackoffQueue(logger, unschedulablePods, event, oldObj, newObj)
 }
 
-// NOTE: 调用此方法前必须确保持有 p.lock 写锁
-func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(logger *zap.Logger, podInfoList []*framework.QueuedPodInfo, event framework.ClusterEvent, oldObj, newObj interface{}) {
-	if len(podInfoList) == 0 || !p.isEventOfInterest(logger, event) {
-		return
-	}
+	// NOTE: 调用此方法前必须确保持有 p.lock 写锁
+	func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(logger *zap.Logger, podInfoList []*framework.QueuedPodInfo, event framework.ClusterEvent, oldObj, newObj interface{}) {
+		if len(podInfoList) == 0 || !p.isEventOfInterest(logger, event) {
+			return
+		}
 
-	activated := false // 标记位：记录是否至少有一个 Pod 成功进入了活跃队列
-	eventStr := fmt.Sprintf("%v", event)
+		activated := false // 标记位：记录是否至少有一个 Pod 成功进入了活跃队列
+		eventStr := fmt.Sprintf("%v", event)
 
-	for _, pInfo := range podInfoList {
-		// 1. 呼叫大脑，进行精准预判：“你看它还有救吗？”
-		schedulingHint := p.isPodWorthRequeuing(logger, pInfo, event, oldObj, newObj)
+		// [PERF] 统计
+		totalPods := len(podInfoList)
+		wokenPods := 0
+		skippedPods := 0
 
-		if schedulingHint == queueSkip {
-			// 大脑说：没救，继续睡。
-			logger.Debug("Event is not making pod schedulable",
+		for _, pInfo := range podInfoList {
+			// 1. 呼叫大脑，进行精准预判
+			schedulingHint := p.isPodWorthRequeuing(logger, pInfo, event, oldObj, newObj)
+
+			if schedulingHint == queueSkip {
+				// 大脑说：没救，继续睡
+				skippedPods++
+				logger.Debug("Event is not making pod schedulable",
+					zap.String("pod", pInfo.Pod.Name),
+					zap.Any("event", event))
+				continue
+			}
+
+			// 2. 大脑说有救！先把旧账消了：从不可调度池里把它彻底抹除
+			p.unschedulablePods.delete(pInfo.Pod, pInfo.Gated)
+
+			// 3. 呼叫调度枢纽：根据大脑给出的策略，给它安排正确的去处
+			queueName := p.requeuePodViaQueueingHint(logger, pInfo, schedulingHint, eventStr)
+			wokenPods++
+
+			logger.Debug("Pod evaluated and moved",
 				zap.String("pod", pInfo.Pod.Name),
-				zap.Any("event", event))
-			continue
+				zap.Any("event", event),
+				zap.String("queue", queueName))
+
+			// 4. 关键记录：只要它进了 ActiveQ，就说明有活干了！
+			if queueName == activeQ {
+				activated = true
+			}
 		}
 
-		// 2. 大脑说有救！先把旧账消了：从不可调度池里把它彻底抹除
-		p.unschedulablePods.delete(pInfo.Pod, pInfo.Gated)
+		// （注：Lyra 中暂略原生的 inFlightEvents / moveRequestCycle 在途并发保护机制，
+		// 若未来遇到正在调度的 Pod 与新事件并发冲突的罕见边界条件，可再做补齐。）
 
-		// 3. 呼叫调度枢纽：根据大脑给出的策略，给它安排正确的去处
-		queueName := p.requeuePodViaQueueingHint(logger, pInfo, schedulingHint, eventStr)
+		// 5. 🌟 终极广播！惊蛰唤醒！
+		if activated {
+			// activeQ 内部拥有一个 sync.Cond (条件变量)。
+			// 当调度循环发现 activeQ 为空时，它会调用 Wait() 挂起休眠，不吃一点 CPU。
+			// broadcast() 会唤醒所有休眠的调度主协程："快起床，有机器空出来了，开始干活！"
+			p.activeQ.broadcast()
+		}
 
-		logger.Debug("Pod evaluated and moved",
-			zap.String("pod", pInfo.Pod.Name),
-			zap.Any("event", event),
-			zap.String("queue", queueName))
-
-		// 4. 关键记录：只要它进了 ActiveQ，就说明有活干了！
-		if queueName == activeQ {
-			activated = true
+		// [PERF] 记录队列唤醒统计
+		if totalPods > 0 {
+			logger.Info("[PERF] Queue wakeup stats",
+				zap.String("event", eventStr),
+				zap.Int("total_pods", totalPods),
+				zap.Int("woken_pods", wokenPods),
+				zap.Int("skipped_pods", skippedPods),
+				zap.Float64("skip_ratio", float64(skippedPods)/float64(totalPods)),
+			)
 		}
 	}
-
-	// （注：Lyra 中暂略原生的 inFlightEvents / moveRequestCycle 在途并发保护机制，
-	// 若未来遇到正在调度的 Pod 与新事件并发冲突的罕见边界条件，可再做补齐。）
-
-	// 5. 🌟 终极广播！惊蛰唤醒！
-	if activated {
-		// activeQ 内部拥有一个 sync.Cond (条件变量)。
-		// 当调度循环发现 activeQ 为空时，它会调用 Wait() 挂起休眠，不吃一点 CPU。
-		// broadcast() 会唤醒所有休眠的调度主协程：“快起床，有机器空出来了，开始干活！”
-		p.activeQ.broadcast()
-	}
-}
 
 // AddUnschedulableIfNotPresent 尝试将调度失败的 Pod 放入不可调度池。
 // 如果在它调度期间发生了潜在的资源释放事件，则直接放入退避队列以防错过。
@@ -888,6 +930,28 @@ func (p *PriorityQueue) GetPod(name, namespace string) (pInfo *framework.QueuedP
 // PodsInActiveQ returns all the Pods in the activeQ.
 func (p *PriorityQueue) PodsInActiveQ() []*corev1.Pod {
 	return p.activeQ.list()
+}
+
+// SetQueueingHintMap sets the event to hint function mapping.
+func (p *PriorityQueue) SetQueueingHintMap(hintMap map[framework.ClusterEvent][]framework.ClusterEventWithPluginHint) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	// If QueueingHint is disabled via env, ignore the hint map
+	if os.Getenv("LYRA_QUEUEING_HINT") == "disabled" {
+		return
+	}
+
+	// Convert to internal structure
+	p.queueingHintMap = make(map[framework.ClusterEvent][]*queueingHintFunction)
+	for event, hints := range hintMap {
+		for _, hint := range hints {
+			p.queueingHintMap[event] = append(p.queueingHintMap[event], &queueingHintFunction{
+				PluginName:     hint.PluginName,
+				QueueingHintFn: hint.QueueingHintFn,
+			})
+		}
+	}
 }
 
 func podInfoKeyFunc(pInfo *framework.QueuedPodInfo) string {

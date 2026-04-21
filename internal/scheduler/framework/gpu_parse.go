@@ -149,8 +149,8 @@ func ParseNodeHamiAnnotation(node *corev1.Node) ([]ParsedGPUInfo, error) {
 
 	for _, rec := range records {
 		fields := strings.Split(rec, ",")
-		// 校验长度防止切片越界
-		if len(fields) < 6 {
+		// 校验长度防止切片越界 (至少需要UUID,MaxVGPUs,Memory,Core,Type共5个字段)
+		if len(fields) < 5 {
 			continue
 		}
 

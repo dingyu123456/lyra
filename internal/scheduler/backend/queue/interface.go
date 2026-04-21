@@ -44,4 +44,9 @@ type SchedulingQueue interface {
 	//PendingPods() ([]*corev1.Pod, string)
 	//InFlightPods() []*corev1.Pod
 	PodsInActiveQ() []*corev1.Pod
+
+	// --- QueueingHint 配置 ---
+	// SetQueueingHintMap 设置事件到 hint 函数的映射（从插件的 EventsToRegister 收集）
+	// key: 事件类型, value: 插件名 + hint函数 的列表
+	SetQueueingHintMap(hintMap map[framework.ClusterEvent][]framework.ClusterEventWithPluginHint)
 }

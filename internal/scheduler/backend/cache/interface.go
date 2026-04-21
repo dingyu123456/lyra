@@ -28,6 +28,7 @@ type Cache interface {
 	IsAssumedPod(pod *corev1.Pod) (bool, error)
 
 	UpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) error
+	FullUpdateSnapshot(logger *zap.Logger, snapshot *Snapshot) error
 
 	// --- 2. Informer 事件刷新契约 ---
 	AddPod(logger *zap.Logger, pod *corev1.Pod) error

@@ -144,9 +144,9 @@ func (g *GPUResourceFit) EventsToRegister(ctx context.Context) ([]framework.Clus
 	// 注：我们不支持 Pod 的原地垂直缩容，所以不需要监听 UpdatePodScaleDown
 	podActionType := framework.Delete
 
-	// 2. Node 动作：节点新增，或者节点的 Allocatable (可分配资源) 发生变化时
-	// 注：多集群环境下，子集群的 Hami 如果动态发现并上报了新的 vGPU，也会触发 Update
-	nodeActionType := framework.Add | framework.UpdateNodeAllocatable
+	// 2. Node 动作：节点新增，或者节点的 GPU 注解发生变化时
+	// 注：HAMI GPU 信息存储在 hami.io/node-nvidia-register 注解中，需要监听 UpdateNodeAnnotation
+	nodeActionType := framework.Add | framework.UpdateNodeAllocatable | framework.UpdateNodeAnnotation
 
 	return []framework.ClusterEventWithHint{
 		{
@@ -205,9 +205,45 @@ func (g *GPUResourceFit) isSchedulableAfterNodeChange(logger *zap.Logger, pod *c
 	}
 
 	// 场景 B: 节点发生了更新 (Update)
-	// 在 Lyra 这种多集群架构中，要精确在队列锁里解析底层节点的 GPU Annotation 变化非常耗时。
-	// 为了保证调度主干极速运转：只要发生 Allocatable 变化，我们统一保守地唤醒重试。
-	// 复杂的容量精确计算留给 Filter 阶段去并发执行。
-	logger.Debug("Node allocatable changed, triggering a retry", zap.String("node", modifiedNode.Name))
-	return framework.Queue, nil
+	// 检查 Pod 的 GPU 类型要求和节点 GPU 类型是否匹配
+	podReq := framework.ParsePodGPUReqs(pod)
+
+	// 如果 Pod 没有指定 GPU 类型要求（任何 GPU 都可以），唤醒
+	if len(podReq.Types) == 0 {
+		logger.Debug("Pod has no GPU type requirement, triggering retry", zap.String("pod", pod.Name))
+		return framework.Queue, nil
+	}
+
+	// 如果 Pod 指定了 GPU 类型，解析节点的 GPU 类型
+	nodeGPUs, err := framework.ParseNodeHamiAnnotation(modifiedNode)
+	if err != nil || nodeGPUs == nil {
+		// 节点没有 GPU 或解析失败，保守唤醒
+		logger.Debug("Node has no GPU or parse failed, triggering retry", zap.String("node", modifiedNode.Name))
+		return framework.Queue, nil
+	}
+
+	// 收集节点支持的 GPU 类型
+	nodeTypes := make(map[string]bool)
+	for _, gpu := range nodeGPUs {
+		nodeTypes[gpu.Type] = true
+	}
+
+	// 检查 Pod 的 GPU 类型要求是否能被节点满足
+	for _, requiredType := range podReq.Types {
+		if nodeTypes[requiredType] {
+			// 节点有这个类型的 GPU，Pod 可能可以调度
+			logger.Debug("Node has matching GPU type, triggering retry",
+				zap.String("pod", pod.Name),
+				zap.String("requiredType", requiredType),
+				zap.String("node", modifiedNode.Name))
+			return framework.Queue, nil
+		}
+	}
+
+	// 节点没有 Pod 需要的 GPU 类型，不唤醒
+	logger.Debug("Node GPU type doesn't match pod requirement, skipping",
+		zap.String("pod", pod.Name),
+		zap.Strings("requiredTypes", podReq.Types),
+		zap.String("node", modifiedNode.Name))
+	return framework.QueueSkip, nil
 }
